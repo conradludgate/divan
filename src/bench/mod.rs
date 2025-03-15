@@ -70,6 +70,15 @@ pub struct BencherConfig<GenI = Unit> {
     gen_input: GenI,
 }
 
+/// Public-in-private type for statically-typed `Bencher` configuration.
+///
+/// This enables configuring `Bencher` using the builder pattern with zero
+/// runtime cost.
+pub struct Singleton<GenS, GenI = Unit> {
+    gen_singleton: GenS,
+    gen_input: GenI,
+}
+
 impl<C> fmt::Debug for Bencher<'_, '_, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Bencher").finish_non_exhaustive()
@@ -156,6 +165,35 @@ impl<'a, 'b> Bencher<'a, 'b> {
     /// ```
     pub fn with_inputs<G>(self, gen_input: G) -> Bencher<'a, 'b, BencherConfig<G>> {
         Bencher { context: self.context, config: BencherConfig { gen_input } }
+    }
+
+    /// WIP
+    pub fn with_singleton<G>(
+        self,
+        gen_singleton: G,
+    ) -> Bencher<'a, 'b, BencherConfig<Singleton<G>>> {
+        Bencher {
+            context: self.context,
+            config: BencherConfig { gen_input: Singleton { gen_singleton, gen_input: Unit } },
+        }
+    }
+}
+
+impl<'a, 'b, GenS> Bencher<'a, 'b, BencherConfig<Singleton<GenS>>> {
+    /// WIP
+    pub fn with_inputs<G>(
+        self,
+        gen_input: G,
+    ) -> Bencher<'a, 'b, BencherConfig<Singleton<GenS, G>>> {
+        Bencher {
+            context: self.context,
+            config: BencherConfig {
+                gen_input: Singleton {
+                    gen_singleton: self.config.gen_input.gen_singleton,
+                    gen_input,
+                },
+            },
+        }
     }
 }
 
@@ -323,8 +361,9 @@ where
         GenI: Fn() -> I + Sync,
     {
         self.context.bench_loop_threaded(
-            self.config.gen_input,
-            |input| {
+            || {},
+            |()| (self.config.gen_input)(),
+            |(), input| {
                 // SAFETY: Input is guaranteed to be initialized and not
                 // currently referenced by anything else.
                 let input = unsafe { input.get().read().assume_init() };
@@ -406,8 +445,9 @@ where
     {
         // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
         self.context.bench_loop_threaded(
-            self.config.gen_input,
-            |input| {
+            || {},
+            |()| (self.config.gen_input)(),
+            |(), input| {
                 // SAFETY: Input is guaranteed to be initialized and not
                 // currently referenced by anything else.
                 let input = unsafe { (*input.get()).assume_init_mut() };
@@ -458,6 +498,65 @@ where
                 let input = unsafe { (*input.get()).assume_init_mut() };
 
                 benched(input)
+            },
+            // Input ownership was not transferred to `benched`.
+            |input| {
+                // SAFETY: This function is called after `benched` outputs are
+                // dropped, so we have exclusive access.
+                unsafe { (*input.get()).assume_init_drop() }
+            },
+        );
+    }
+}
+
+/// <span id="input-bench"></span> Benchmark over [generated inputs](Self::with_inputs).
+impl<'a, 'b> Bencher<'a, 'b> {
+    /// WIP
+    pub fn bench_value2<S, GenS, I, GenI, O, B>(self, singletons: GenS, inputs: GenI, benched: B)
+    where
+        S: Sync,
+        B: for<'s> Fn(&'s S, I) -> O + Sync,
+        GenI: for<'s> Fn(&'s S) -> I + Sync,
+        GenS: FnMut() -> S,
+    {
+        // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
+        self.context.bench_loop_threaded(
+            singletons,
+            inputs,
+            |singleton, input| {
+                // SAFETY: Input is guaranteed to be initialized and not
+                // currently referenced by anything else.
+                let input = unsafe { input.get().read().assume_init() };
+
+                benched(singleton, input)
+            },
+            // Input ownership was not transferred to `benched`.
+            |input| {
+                // SAFETY: This function is called after `benched` outputs are
+                // dropped, so we have exclusive access.
+                unsafe { (*input.get()).assume_init_drop() }
+            },
+        );
+    }
+
+    /// WIP
+    pub fn bench_refs2<S, GenS, I, GenI, O, B>(self, singletons: GenS, inputs: GenI, benched: B)
+    where
+        S: Sync,
+        B: for<'s, 'i> Fn(&'s S, &'i mut I) -> O + Sync,
+        GenI: for<'s> Fn(&'s S) -> I + Sync,
+        GenS: FnMut() -> S,
+    {
+        // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
+        self.context.bench_loop_threaded(
+            singletons,
+            inputs,
+            |singleton, input| {
+                // SAFETY: Input is guaranteed to be initialized and not
+                // currently referenced by anything else.
+                let input = unsafe { (*input.get()).assume_init_mut() };
+
+                benched(singleton, input)
             },
             // Input ownership was not transferred to `benched`.
             |input| {
@@ -571,9 +670,10 @@ impl<'a> BenchContext<'a> {
             let drop_input = SyncWrap::new(drop_input);
 
             self.thread_count = NonZeroUsize::MIN;
-            self.bench_loop_threaded::<I, O>(
-                || (*gen_input.get())(),
-                |input| (*benched.get())(input),
+            self.bench_loop_threaded::<(), I, O>(
+                || {},
+                |()| (*gen_input.get())(),
+                |(), input| (*benched.get())(input),
                 |input| drop_input(input),
             )
         }
@@ -595,10 +695,11 @@ impl<'a> BenchContext<'a> {
     /// - All instances of `O` returned from `benched` have been dropped.
     /// - The same guarantees for `I` apply as in `benched`, unless `benched`
     ///   escaped references to `I`.
-    fn bench_loop_threaded<I, O>(
+    fn bench_loop_threaded<S: Sync, I, O>(
         &mut self,
-        gen_input: impl Fn() -> I + Sync,
-        benched: impl Fn(&UnsafeCell<MaybeUninit<I>>) -> O + Sync,
+        mut gen_singleton: impl FnMut() -> S,
+        gen_input: impl Fn(&S) -> I + Sync,
+        benched: impl Fn(&S, &UnsafeCell<MaybeUninit<I>>) -> O + Sync,
         drop_input: impl Fn(&UnsafeCell<MaybeUninit<I>>) + Sync,
     ) {
         self.did_run = true;
@@ -676,6 +777,8 @@ impl<'a> BenchContext<'a> {
 
             let barrier = if is_single_thread { None } else { Some(Barrier::new(thread_count)) };
 
+            let singleton = gen_singleton();
+
             // Sample loop helper:
             let record_sample = || -> RawSample {
                 let mut counter_totals: [u128; KnownCounterKind::COUNT] =
@@ -696,8 +799,12 @@ impl<'a> BenchContext<'a> {
                 };
 
                 // Sample loop:
-                let ([start, end], alloc_info) =
-                    record_sample(sample_size as usize, barrier.as_ref(), &mut count_input);
+                let ([start, end], alloc_info) = record_sample(
+                    &singleton,
+                    sample_size as usize,
+                    barrier.as_ref(),
+                    &mut count_input,
+                );
 
                 RawSample { start, end, timer, alloc_info, counter_totals }
             };
@@ -817,12 +924,13 @@ impl<'a> BenchContext<'a> {
 
     /// Returns a closure that takes the sample size and input counter, and then
     /// returns a newly recorded sample.
-    fn sample_recorder<I, O>(
+    fn sample_recorder<S, I, O>(
         &self,
-        gen_input: impl Fn() -> I,
-        benched: impl Fn(&UnsafeCell<MaybeUninit<I>>) -> O,
+        // gen_singleton: impl Fn() -> S,
+        gen_input: impl Fn(&S) -> I + Sync,
+        benched: impl Fn(&S, &UnsafeCell<MaybeUninit<I>>) -> O,
         drop_input: impl Fn(&UnsafeCell<MaybeUninit<I>>),
-    ) -> impl Fn(usize, Option<&Barrier>, &mut dyn FnMut(&I)) -> ([Timestamp; 2], ThreadAllocInfo)
+    ) -> impl Fn(&S, usize, Option<&Barrier>, &mut dyn FnMut(&I)) -> ([Timestamp; 2], ThreadAllocInfo)
     {
         // We defer:
         // - Usage of `gen_input` values.
@@ -833,7 +941,10 @@ impl<'a> BenchContext<'a> {
 
         let timer_kind = self.shared_context.timer.kind();
 
-        move |sample_size: usize, barrier: Option<&Barrier>, count_input: &mut dyn FnMut(&I)| {
+        move |singleton: &S,
+              sample_size: usize,
+              barrier: Option<&Barrier>,
+              count_input: &mut dyn FnMut(&I)| {
             let mut defer_store = DeferStore::<I, O>::default();
 
             let mut saved_alloc_info = ThreadAllocInfo::new();
@@ -902,7 +1013,7 @@ impl<'a> BenchContext<'a> {
                 // Run `gen_input` the expected number of times in case it
                 // updates external state used by `benched`.
                 for _ in 0..sample_size {
-                    let input = gen_input();
+                    let input = gen_input(singleton);
                     count_input(&input);
 
                     // Inputs are consumed/dropped later.
@@ -918,7 +1029,7 @@ impl<'a> BenchContext<'a> {
                     // thin air.
                     let input = unsafe { UnsafeCell::new(MaybeUninit::<I>::zeroed()) };
 
-                    mem::forget(black_box(benched(&input)));
+                    mem::forget(black_box(benched(singleton, &input)));
                 }
 
                 sample_end = UntaggedTimestamp::end(timer_kind);
@@ -951,7 +1062,7 @@ impl<'a> BenchContext<'a> {
                         for DeferSlot { input, .. } in defer_slots_slice {
                             // SAFETY: We have exclusive access to `input`.
                             let input = unsafe { &mut *input.get() };
-                            let input = input.write(gen_input());
+                            let input = input.write(gen_input(singleton));
                             count_input(input);
 
                             // Make input opaque to benchmarked function.
@@ -971,7 +1082,7 @@ impl<'a> BenchContext<'a> {
                             // initialized and we have exclusive access to the
                             // output slot.
                             unsafe {
-                                let output = benched(&defer_slot.input);
+                                let output = benched(singleton, &defer_slot.input);
                                 *defer_slot.output.get() = MaybeUninit::new(output);
                             }
                         }
@@ -1004,7 +1115,7 @@ impl<'a> BenchContext<'a> {
                         for input in defer_inputs_slice {
                             // SAFETY: We have exclusive access to `input`.
                             let input = unsafe { &mut *input.get() };
-                            let input = input.write(gen_input());
+                            let input = input.write(gen_input(singleton));
                             count_input(input);
 
                             // Make input opaque to benchmarked function.
@@ -1022,7 +1133,7 @@ impl<'a> BenchContext<'a> {
                         for input in defer_inputs_iter {
                             // SAFETY: All inputs in `defer_store` were
                             // initialized.
-                            black_box_drop(unsafe { benched(input) });
+                            black_box_drop(unsafe { benched(singleton, input) });
                         }
 
                         sample_end = UntaggedTimestamp::end(timer_kind);
