@@ -461,6 +461,15 @@ mod run_count {
             })
         });
     }
+
+    #[test]
+    fn singleton() {
+        test(|b, f| {
+            b.with_singleton(|| 1)
+                .with_inputs(|_: &usize| 2)
+                .bench_refs(|_: &usize, _: &mut usize| -> () { f() })
+        });
+    }
 }
 
 mod no_input {

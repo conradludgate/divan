@@ -66,15 +66,7 @@ pub struct Bencher<'a, 'b, C = BencherConfig> {
 ///
 /// This enables configuring `Bencher` using the builder pattern with zero
 /// runtime cost.
-pub struct BencherConfig<GenI = Unit> {
-    gen_input: GenI,
-}
-
-/// Public-in-private type for statically-typed `Bencher` configuration.
-///
-/// This enables configuring `Bencher` using the builder pattern with zero
-/// runtime cost.
-pub struct Singleton<GenS, GenI = Unit> {
+pub struct BencherConfig<GenS = Unit, GenI = Unit> {
     gen_singleton: GenS,
     gen_input: GenI,
 }
@@ -88,7 +80,7 @@ impl<C> fmt::Debug for Bencher<'_, '_, C> {
 impl<'a, 'b> Bencher<'a, 'b> {
     #[inline]
     pub(crate) fn new(context: &'a mut BenchContext<'b>) -> Self {
-        Self { context, config: BencherConfig { gen_input: Unit } }
+        Self { context, config: BencherConfig { gen_singleton: Unit, gen_input: Unit } }
     }
 }
 
@@ -138,7 +130,19 @@ impl<'a, 'b> Bencher<'a, 'b> {
         // should have no overhead.
         self.with_inputs(|| ()).bench_local_values(|_: ()| benched());
     }
+}
 
+impl<'a, 'b, GenI> Bencher<'a, 'b, BencherConfig<Unit, GenI>> {
+    /// WIP
+    pub fn with_singleton<G>(self, gen_singleton: G) -> Bencher<'a, 'b, BencherConfig<G, GenI>> {
+        Bencher {
+            context: self.context,
+            config: BencherConfig { gen_singleton, gen_input: self.config.gen_input },
+        }
+    }
+}
+
+impl<'a, 'b, GenS> Bencher<'a, 'b, BencherConfig<GenS>> {
     /// Generate inputs for the [benchmarked function](#input-bench).
     ///
     /// Time spent generating inputs does not affect benchmark timing.
@@ -163,41 +167,15 @@ impl<'a, 'b> Bencher<'a, 'b> {
     ///         });
     /// }
     /// ```
-    pub fn with_inputs<G>(self, gen_input: G) -> Bencher<'a, 'b, BencherConfig<G>> {
-        Bencher { context: self.context, config: BencherConfig { gen_input } }
-    }
-
-    /// WIP
-    pub fn with_singleton<G>(
-        self,
-        gen_singleton: G,
-    ) -> Bencher<'a, 'b, BencherConfig<Singleton<G>>> {
+    pub fn with_inputs<G>(self, gen_input: G) -> Bencher<'a, 'b, BencherConfig<GenS, G>> {
         Bencher {
             context: self.context,
-            config: BencherConfig { gen_input: Singleton { gen_singleton, gen_input: Unit } },
+            config: BencherConfig { gen_input, gen_singleton: self.config.gen_singleton },
         }
     }
 }
 
-impl<'a, 'b, GenS> Bencher<'a, 'b, BencherConfig<Singleton<GenS>>> {
-    /// WIP
-    pub fn with_inputs<G>(
-        self,
-        gen_input: G,
-    ) -> Bencher<'a, 'b, BencherConfig<Singleton<GenS, G>>> {
-        Bencher {
-            context: self.context,
-            config: BencherConfig {
-                gen_input: Singleton {
-                    gen_singleton: self.config.gen_input.gen_singleton,
-                    gen_input,
-                },
-            },
-        }
-    }
-}
-
-impl<'a, 'b, GenI> Bencher<'a, 'b, BencherConfig<GenI>> {
+impl<'a, 'b, GenS, GenI> Bencher<'a, 'b, BencherConfig<GenS, GenI>> {
     /// Assign a [`Counter`] for all iterations of the benchmarked function.
     ///
     /// This will either:
@@ -239,7 +217,7 @@ impl<'a, 'b, GenI> Bencher<'a, 'b, BencherConfig<GenI>> {
 }
 
 /// <span id="input-bench"></span> Benchmark over [generated inputs](Self::with_inputs).
-impl<'a, 'b, I, GenI> Bencher<'a, 'b, BencherConfig<GenI>>
+impl<'a, 'b, I, GenS, GenI> Bencher<'a, 'b, BencherConfig<GenS, GenI>>
 where
     GenI: FnMut() -> I,
 {
@@ -328,6 +306,25 @@ where
             KnownCounterKind::Items => self.input_counter(|c| ItemsCount::from(c)),
         }
     }
+}
+
+/// <span id="input-bench"></span> Benchmark over [generated inputs](Self::with_inputs).
+impl<'a, 'b, I, GenI> Bencher<'a, 'b, BencherConfig<Unit, GenI>>
+where
+    GenI: FnMut() -> I,
+{
+    fn inner_with_singleton(self) -> Bencher<'a, 'b, BencherConfig<impl FnMut(), impl Fn(&()) -> I>>
+    where
+        GenI: Fn() -> I + Sync,
+    {
+        Bencher {
+            context: self.context,
+            config: BencherConfig {
+                gen_singleton: || {},
+                gen_input: move |_: &()| (self.config.gen_input)(),
+            },
+        }
+    }
 
     /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
     /// provided by-value.
@@ -360,19 +357,7 @@ where
         B: Fn(I) -> O + Sync,
         GenI: Fn() -> I + Sync,
     {
-        self.context.bench_loop_threaded(
-            || {},
-            |()| (self.config.gen_input)(),
-            |(), input| {
-                // SAFETY: Input is guaranteed to be initialized and not
-                // currently referenced by anything else.
-                let input = unsafe { input.get().read().assume_init() };
-
-                benched(input)
-            },
-            // Input ownership is transferred to `benched`.
-            |_input| {},
-        );
+        self.inner_with_singleton().bench_value(move |&(), input| benched(input));
     }
 
     /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
@@ -443,24 +428,7 @@ where
         B: Fn(&mut I) -> O + Sync,
         GenI: Fn() -> I + Sync,
     {
-        // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
-        self.context.bench_loop_threaded(
-            || {},
-            |()| (self.config.gen_input)(),
-            |(), input| {
-                // SAFETY: Input is guaranteed to be initialized and not
-                // currently referenced by anything else.
-                let input = unsafe { (*input.get()).assume_init_mut() };
-
-                benched(input)
-            },
-            // Input ownership was not transferred to `benched`.
-            |input| {
-                // SAFETY: This function is called after `benched` outputs are
-                // dropped, so we have exclusive access.
-                unsafe { (*input.get()).assume_init_drop() }
-            },
-        );
+        self.inner_with_singleton().bench_refs(move |&(), input| benched(input));
     }
 
     /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
@@ -510,9 +478,13 @@ where
 }
 
 /// <span id="input-bench"></span> Benchmark over [generated inputs](Self::with_inputs).
-impl<'a, 'b> Bencher<'a, 'b> {
+impl<'a, 'b, S, I, GenS, GenI> Bencher<'a, 'b, BencherConfig<GenS, GenI>>
+where
+    GenS: FnMut() -> S,
+    GenI: FnMut(&S) -> I,
+{
     /// WIP
-    pub fn bench_value2<S, GenS, I, GenI, O, B>(self, singletons: GenS, inputs: GenI, benched: B)
+    pub fn bench_value<O, B>(self, benched: B)
     where
         S: Sync,
         B: for<'s> Fn(&'s S, I) -> O + Sync,
@@ -521,8 +493,8 @@ impl<'a, 'b> Bencher<'a, 'b> {
     {
         // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
         self.context.bench_loop_threaded(
-            singletons,
-            inputs,
+            self.config.gen_singleton,
+            self.config.gen_input,
             |singleton, input| {
                 // SAFETY: Input is guaranteed to be initialized and not
                 // currently referenced by anything else.
@@ -540,7 +512,7 @@ impl<'a, 'b> Bencher<'a, 'b> {
     }
 
     /// WIP
-    pub fn bench_refs2<S, GenS, I, GenI, O, B>(self, singletons: GenS, inputs: GenI, benched: B)
+    pub fn bench_refs<O, B>(self, benched: B)
     where
         S: Sync,
         B: for<'s, 'i> Fn(&'s S, &'i mut I) -> O + Sync,
@@ -549,8 +521,8 @@ impl<'a, 'b> Bencher<'a, 'b> {
     {
         // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
         self.context.bench_loop_threaded(
-            singletons,
-            inputs,
+            self.config.gen_singleton,
+            self.config.gen_input,
             |singleton, input| {
                 // SAFETY: Input is guaranteed to be initialized and not
                 // currently referenced by anything else.
