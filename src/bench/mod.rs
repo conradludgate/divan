@@ -326,6 +326,18 @@ where
         }
     }
 
+    fn inner_with_singleton_mut(
+        mut self,
+    ) -> Bencher<'a, 'b, BencherConfig<impl FnMut(), impl FnMut(&()) -> I>> {
+        Bencher {
+            context: self.context,
+            config: BencherConfig {
+                gen_singleton: || {},
+                gen_input: move |_: &()| (self.config.gen_input)(),
+            },
+        }
+    }
+
     /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
     /// provided by-value.
     ///
@@ -357,7 +369,7 @@ where
         B: Fn(I) -> O + Sync,
         GenI: Fn() -> I + Sync,
     {
-        self.inner_with_singleton().bench_value(move |&(), input| benched(input));
+        self.inner_with_singleton().bench_values(move |&(), input| benched(input));
     }
 
     /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
@@ -387,18 +399,7 @@ where
     where
         B: FnMut(I) -> O,
     {
-        self.context.bench_loop_local(
-            self.config.gen_input,
-            |input| {
-                // SAFETY: Input is guaranteed to be initialized and not
-                // currently referenced by anything else.
-                let input = unsafe { input.get().read().assume_init() };
-
-                benched(input)
-            },
-            // Input ownership is transferred to `benched`.
-            |_input| {},
-        );
+        self.inner_with_singleton_mut().bench_local_values(|_: &(), input| benched(input));
     }
 
     /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
@@ -457,23 +458,7 @@ where
     where
         B: FnMut(&mut I) -> O,
     {
-        // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
-        self.context.bench_loop_local(
-            self.config.gen_input,
-            |input| {
-                // SAFETY: Input is guaranteed to be initialized and not
-                // currently referenced by anything else.
-                let input = unsafe { (*input.get()).assume_init_mut() };
-
-                benched(input)
-            },
-            // Input ownership was not transferred to `benched`.
-            |input| {
-                // SAFETY: This function is called after `benched` outputs are
-                // dropped, so we have exclusive access.
-                unsafe { (*input.get()).assume_init_drop() }
-            },
-        );
+        self.inner_with_singleton_mut().bench_local_refs(|_: &(), input| benched(input));
     }
 }
 
@@ -483,13 +468,37 @@ where
     GenS: FnMut() -> S,
     GenI: FnMut(&S) -> I,
 {
-    /// WIP
-    pub fn bench_value<O, B>(self, benched: B)
+    /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
+    /// provided by-value.
+    ///
+    /// Per-iteration means the benchmarked function is called exactly once for
+    /// each generated input.
+    ///
+    /// The function can be benchmarked in parallel using the [`threads`
+    /// option](macro@crate::bench#threads). If the function is strictly
+    /// single-threaded, use [`Bencher::bench_local_values`] instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #[divan::bench]
+    /// fn bench(bencher: divan::Bencher) {
+    ///     bencher
+    ///         .with_inputs(|| {
+    ///             // Generate input:
+    ///             String::from("...")
+    ///         })
+    ///         .bench_values(|s| {
+    ///             // Use input by-value:
+    ///             s + "123"
+    ///         });
+    /// }
+    /// ```
+    pub fn bench_values<O, B>(self, benched: B)
     where
         S: Sync,
         B: for<'s> Fn(&'s S, I) -> O + Sync,
         GenI: for<'s> Fn(&'s S) -> I + Sync,
-        GenS: FnMut() -> S,
     {
         // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
         self.context.bench_loop_threaded(
@@ -511,16 +520,124 @@ where
         );
     }
 
-    /// WIP
+    /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
+    /// provided by-value.
+    ///
+    /// Per-iteration means the benchmarked function is called exactly once for
+    /// each generated input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #[divan::bench]
+    /// fn bench(bencher: divan::Bencher) {
+    ///     let mut values = Vec::new();
+    ///     bencher
+    ///         .with_inputs(|| {
+    ///             // Generate input:
+    ///             String::from("...")
+    ///         })
+    ///         .bench_local_values(|s| {
+    ///             // Use input by-value:
+    ///             values.push(s);
+    ///         });
+    /// }
+    /// ```
+    pub fn bench_local_values<O, B>(self, mut benched: B)
+    where
+        B: FnMut(&S, I) -> O,
+    {
+        self.context.bench_loop_local(
+            self.config.gen_singleton,
+            self.config.gen_input,
+            |singleton, input| {
+                // SAFETY: Input is guaranteed to be initialized and not
+                // currently referenced by anything else.
+                let input = unsafe { input.get().read().assume_init() };
+
+                benched(singleton, input)
+            },
+            // Input ownership is transferred to `benched`.
+            |_input| {},
+        );
+    }
+
+    /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
+    /// provided by-reference.
+    ///
+    /// Per-iteration means the benchmarked function is called exactly once for
+    /// each generated input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #[divan::bench]
+    /// fn bench(bencher: divan::Bencher) {
+    ///     bencher
+    ///         .with_inputs(|| {
+    ///             // Generate input:
+    ///             String::from("...")
+    ///         })
+    ///         .bench_refs(|s| {
+    ///             // Use input by-reference:
+    ///             *s += "123";
+    ///         });
+    /// }
+    /// ```
     pub fn bench_refs<O, B>(self, benched: B)
     where
         S: Sync,
         B: for<'s, 'i> Fn(&'s S, &'i mut I) -> O + Sync,
-        GenI: for<'s> Fn(&'s S) -> I + Sync,
-        GenS: FnMut() -> S,
+        GenI: Fn(&S) -> I + Sync,
     {
         // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
         self.context.bench_loop_threaded(
+            self.config.gen_singleton,
+            self.config.gen_input,
+            |singleton, input| {
+                // SAFETY: Input is guaranteed to be initialized and not
+                // currently referenced by anything else.
+                let input = unsafe { (*input.get()).assume_init_mut() };
+
+                benched(singleton, input)
+            },
+            // Input ownership was not transferred to `benched`.
+            |input| {
+                // SAFETY: This function is called after `benched` outputs are
+                // dropped, so we have exclusive access.
+                unsafe { (*input.get()).assume_init_drop() }
+            },
+        );
+    }
+
+    /// Benchmarks a function over per-iteration [generated inputs](Self::with_inputs),
+    /// provided by-reference.
+    ///
+    /// Per-iteration means the benchmarked function is called exactly once for
+    /// each generated input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #[divan::bench]
+    /// fn bench(bencher: divan::Bencher) {
+    ///     bencher
+    ///         .with_inputs(|| {
+    ///             // Generate input:
+    ///             String::from("...")
+    ///         })
+    ///         .bench_local_refs(|s| {
+    ///             // Use input by-reference:
+    ///             *s += "123";
+    ///         });
+    /// }
+    /// ```
+    pub fn bench_local_refs<O, B>(self, mut benched: B)
+    where
+        B: FnMut(&S, &mut I) -> O,
+    {
+        // TODO: Allow `O` to reference `&mut I` as long as `I` outlives `O`.
+        self.context.bench_loop_local(
             self.config.gen_singleton,
             self.config.gen_input,
             |singleton, input| {
@@ -628,24 +745,26 @@ impl<'a> BenchContext<'a> {
     /// # Safety
     ///
     /// See `bench_loop_threaded`.
-    pub fn bench_loop_local<I, O>(
+    pub fn bench_loop_local<S, I, O>(
         &mut self,
-        gen_input: impl FnMut() -> I,
-        benched: impl FnMut(&UnsafeCell<MaybeUninit<I>>) -> O,
+        gen_singleton: impl FnMut() -> S,
+        gen_input: impl FnMut(&S) -> I,
+        benched: impl FnMut(&S, &UnsafeCell<MaybeUninit<I>>) -> O,
         drop_input: impl Fn(&UnsafeCell<MaybeUninit<I>>),
     ) {
         // SAFETY: Closures are guaranteed to run on the current thread, so they
         // can safely be mutable and non-`Sync`.
         unsafe {
+            let gen_singleton = SyncWrap::new(UnsafeCell::new(gen_singleton));
             let gen_input = SyncWrap::new(UnsafeCell::new(gen_input));
             let benched = SyncWrap::new(UnsafeCell::new(benched));
             let drop_input = SyncWrap::new(drop_input);
 
             self.thread_count = NonZeroUsize::MIN;
-            self.bench_loop_threaded::<(), I, O>(
-                || {},
-                |()| (*gen_input.get())(),
-                |(), input| (*benched.get())(input),
+            self.bench_loop_threaded::<SyncWrap<S>, I, O>(
+                || SyncWrap::new((*gen_singleton.get())()),
+                |s: &SyncWrap<S>| (*gen_input.get())(&s.value),
+                |s: &SyncWrap<S>, input| (*benched.get())(&s.value, input),
                 |input| drop_input(input),
             )
         }
